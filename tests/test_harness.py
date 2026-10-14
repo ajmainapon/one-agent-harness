@@ -21,8 +21,9 @@ class TestOneAgentHarness(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.root = self.tmp_dir.name
-        # Test workspace with a trailing space (matching real macOS edge case)
-        self.workspace = os.path.join(self.root, "workspace ")
+        # Test workspace with a trailing space on POSIX (macOS/Linux); Windows Win32 strips trailing spaces on mkdir
+        ws_name = "workspace" if os.name == "nt" else "workspace "
+        self.workspace = os.path.join(self.root, ws_name)
         os.makedirs(self.workspace, exist_ok=True)
 
         with open(os.path.join(self.workspace, "AGENTS.md"), "w", encoding="utf-8") as fp:
@@ -32,6 +33,7 @@ class TestOneAgentHarness(unittest.TestCase):
         self.agy_home = os.path.join(self.root, ".gemini", "antigravity")
         self.codex_home = os.path.join(self.root, ".codex")
         self.grok_home = os.path.join(self.root, ".grok")
+        self.harness_home = os.path.join(self.root, ".harness")
 
         self._seed_claude_fixture()
         self._seed_antigravity_fixture()
@@ -43,10 +45,14 @@ class TestOneAgentHarness(unittest.TestCase):
             agy_home=self.agy_home,
             codex_home=self.codex_home,
             grok_home=self.grok_home,
+            harness_home=self.harness_home,
         )
 
     def tearDown(self) -> None:
-        self.tmp_dir.cleanup()
+        try:
+            self.tmp_dir.cleanup()
+        except Exception:
+            pass
 
     def _seed_claude_fixture(self) -> None:
         proj_dir = os.path.join(self.claude_home, "projects", encode_claude_project_dir(self.workspace))
@@ -195,8 +201,8 @@ class TestOneAgentHarness(unittest.TestCase):
                     {
                         "name": "write_to_file",
                         "args": {
-                            "TargetFile": f'"{self.workspace}/harness/adapters/antigravity.py"',
-                            "Cwd": f'"{self.workspace}"',
+                            "TargetFile": json.dumps(f"{self.workspace}/harness/adapters/antigravity.py"),
+                            "Cwd": json.dumps(self.workspace),
                         },
                     }
                 ],

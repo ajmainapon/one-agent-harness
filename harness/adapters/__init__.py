@@ -31,13 +31,16 @@ def normalize_path(path: Optional[str]) -> str:
     raw = path.rstrip("\r\n")
     if raw.startswith("file://"):
         parsed = urlparse(raw)
-        raw = unquote(parsed.path)
-        # On Windows file:///C:/Users/... produces parsed.path == "/C:/Users/..."
-        if re.match(r"^/[a-zA-Z]:[/\\]", raw):
-            raw = raw[1:]
+        raw_path = unquote(parsed.path)
+        if re.match(r"^[a-zA-Z]:$", parsed.netloc):
+            raw = f"{parsed.netloc}{raw_path}"
+        elif re.match(r"^/[a-zA-Z]:[/\\]", raw_path):
+            raw = raw_path[1:]
         elif parsed.netloc and parsed.netloc not in ("", "localhost"):
             # UNC path file://server/share/...
-            raw = f"//{parsed.netloc}{raw}"
+            raw = f"//{parsed.netloc}{raw_path}"
+        else:
+            raw = raw_path
 
     expanded = os.path.expanduser(raw)
     if os.path.exists(expanded):
