@@ -2,6 +2,7 @@
 
 **Universal Cross-Agent Context Bridge for Claude Code, Antigravity, OpenAI Codex, and Grok Build CLI.**
 
+[![CI (Linux · macOS · Windows)](https://github.com/ajmainapon/one-agent-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/ajmainapon/one-agent-harness/actions/workflows/ci.yml)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](#installation-linux--macos--windows)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776ab)](#installation-linux--macos--windows)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20(stdlib%20only)-success)](#architecture)
