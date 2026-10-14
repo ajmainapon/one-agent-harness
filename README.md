@@ -30,14 +30,14 @@ Works out of the box on **Linux** (X11, Wayland, WSL2, SSH/OSC 52), **macOS**, a
 
 **Linux & macOS (bash / zsh / sh):**
 ```bash
-git clone https://github.com/your-org/one-agent-harness.git
+git clone https://github.com/ajmainapon/one-agent-harness.git
 cd one-agent-harness
 chmod +x install.sh && ./install.sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/your-org/one-agent-harness.git
+git clone https://github.com/ajmainapon/one-agent-harness.git
 cd one-agent-harness
 .\install.ps1
 ```
