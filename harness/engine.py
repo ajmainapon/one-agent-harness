@@ -44,10 +44,10 @@ def normalize_agent_name(name: Optional[str]) -> Optional[str]:
 
 def is_scratch_cwd(cwd: Optional[str]) -> bool:
     """Return True if cwd is filesystem root, home root, system32, or an auto-created Desktop app scratch directory."""
-    if not cwd:
+    if not cwd or cwd.strip() in ("/", "\\"):
         return True
     norm = normalize_path(cwd)
-    if not norm or norm == "/":
+    if not norm or norm in ("/", "\\"):
         return True
     # Windows drive root like "C:\" or "C:/"
     if re.match(r"^[a-zA-Z]:[/\\]?$", norm):

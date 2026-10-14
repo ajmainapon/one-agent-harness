@@ -30,7 +30,7 @@ def normalize_path(path: Optional[str]) -> str:
         return ""
     raw = path.rstrip("\r\n")
     if raw.startswith("file://"):
-        parsed = urlparse(raw)
+        parsed = urlparse(raw.replace("\\", "/"))
         raw_path = unquote(parsed.path)
         if re.match(r"^[a-zA-Z]:$", parsed.netloc):
             raw = f"{parsed.netloc}{raw_path}"
