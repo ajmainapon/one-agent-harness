@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "one-agent-harness"
+version = "0.2.0"
+description = "Universal Cross-Agent Context Bridge uniting Claude Code, Antigravity, OpenAI Codex, and Grok Build CLI across Linux, macOS, and Windows."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "One Agent Harness Contributors" }
+]
+keywords = [
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "antigravity",
+    "grok",
+    "mcp",
+    "context-handoff",
+    "developer-tools"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = []
+
+[project.scripts]
+harness = "harness.cli:main"
+one-agent-harness = "harness.cli:main"
+one-agent-harness-mcp = "harness.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harness*"]
+
+[tool.setuptools.package-data]
+harness = ["skills/handoff/SKILL.md"]
