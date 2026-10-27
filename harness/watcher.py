@@ -101,13 +101,16 @@ class ContextWatcher:
             cmd.extend(["--cwd", cwd])
 
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        installed_lib = os.path.join(self.engine.harness_home, "lib")
         env = os.environ.copy()
-        env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            project_root + os.pathsep + installed_lib + os.pathsep + env.get("PYTHONPATH", "")
+        )
 
         os.makedirs(self.engine.harness_home, exist_ok=True)
         pid = spawn_detached_process(
             cmd=cmd,
-            cwd=project_root,
+            cwd=self.engine.harness_home,
             env=env,
             log_file=self.log_file,
         )

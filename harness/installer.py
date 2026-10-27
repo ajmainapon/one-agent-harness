@@ -40,7 +40,22 @@ def install_all(
         "backups": [],
     }
 
-    # 1. Install CLI shims into ~/.local/bin (works on Linux, macOS, Windows CMD/PowerShell, and Git Bash/WSL)
+    # 1. Install a permanent self-contained copy of the `harness` package into ~/.harness/lib/harness
+    # so `harness` keeps working even if the user later deletes or moves the git clone folder!
+    installed_lib = os.path.join(home, ".harness", "lib")
+    os.makedirs(installed_lib, exist_ok=True)
+    pkg_src = os.path.join(root, "harness")
+    pkg_dst = os.path.join(installed_lib, "harness")
+    if os.path.isdir(pkg_src) and os.path.abspath(pkg_src) != os.path.abspath(pkg_dst):
+        if os.path.exists(pkg_dst):
+            shutil.rmtree(pkg_dst, ignore_errors=True)
+        shutil.copytree(
+            pkg_src,
+            pkg_dst,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+
+    # 2. Install CLI shims into ~/.local/bin (works on Linux, macOS, Windows CMD/PowerShell, and Git Bash/WSL)
     local_bin = os.path.join(home, ".local", "bin")
     os.makedirs(local_bin, exist_ok=True)
 
@@ -48,14 +63,15 @@ def install_all(
     mcp_bin = os.path.join(local_bin, "one-agent-harness-mcp")
 
     root_posix = root.replace("\\", "/")
+    lib_posix = installed_lib.replace("\\", "/")
     py_posix = python_bin.replace("\\", "/")
 
     harness_script = f"""#!/bin/sh
-export PYTHONPATH="{root_posix}:${{PYTHONPATH}}"
+export PYTHONPATH="{root_posix}:{lib_posix}:${{PYTHONPATH}}"
 exec "{py_posix}" -m harness.cli "$@"
 """
     mcp_script = f"""#!/bin/sh
-export PYTHONPATH="{root_posix}:${{PYTHONPATH}}"
+export PYTHONPATH="{root_posix}:{lib_posix}:${{PYTHONPATH}}"
 exec "{py_posix}" -m harness.mcp_server "$@"
 """
 
@@ -77,16 +93,16 @@ exec "{py_posix}" -m harness.mcp_server "$@"
 
         cmd_harness_body = (
             "@echo off\r\n"
-            f'set "PYTHONPATH={root};%PYTHONPATH%"\r\n'
+            f'set "PYTHONPATH={root};{installed_lib};%PYTHONPATH%"\r\n'
             f'"{python_bin}" -m harness.cli %*\r\n'
         )
         cmd_mcp_body = (
             "@echo off\r\n"
-            f'set "PYTHONPATH={root};%PYTHONPATH%"\r\n'
+            f'set "PYTHONPATH={root};{installed_lib};%PYTHONPATH%"\r\n'
             f'"{python_bin}" -m harness.mcp_server %*\r\n'
         )
         ps1_harness_body = (
-            f'$env:PYTHONPATH = "{root};" + $env:PYTHONPATH\r\n'
+            f'$env:PYTHONPATH = "{root};{installed_lib};" + $env:PYTHONPATH\r\n'
             f'& "{python_bin}" -m harness.cli @args\r\n'
         )
 
