@@ -183,7 +183,7 @@ class BaseAdapter:
 
     agent_name: str = "base"
 
-    def list_sessions(self, cwd: Optional[str] = None, limit: int = 20) -> List[SessionSummary]:
+    def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         raise NotImplementedError
 
     def extract_bundle(

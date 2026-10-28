@@ -270,7 +270,7 @@ class CodexAdapter(BaseAdapter):
             is_meta_session=is_meta,
         )
 
-    def list_sessions(self, cwd: Optional[str] = None, limit: int = 20) -> List[SessionSummary]:
+    def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         thread_meta = self._load_thread_meta()
         results: List[SessionSummary] = []
         for fpath in self._iter_rollout_files():

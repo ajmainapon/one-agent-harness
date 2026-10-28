@@ -10,16 +10,35 @@ import stat
 import sys
 from typing import Dict, List, Optional
 
-from harness.platform_utils import IS_WINDOWS
+from harness.platform_utils import IS_WINDOWS, atomic_write_text
 
 
 def _backup_file(fpath: str) -> Optional[str]:
     if not os.path.isfile(fpath) or os.path.getsize(fpath) == 0:
         return None
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     bak_path = f"{fpath}.bak.{ts}"
     shutil.copy2(fpath, bak_path)
     return bak_path
+
+
+def _read_mcp_config(path: str) -> dict:
+    """Validate existing settings before making any installation changes."""
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            config = json.load(fp)
+        if not isinstance(config, dict):
+            raise ValueError("the top-level value must be an object")
+        if "mcpServers" in config and not isinstance(config["mcpServers"], dict):
+            raise ValueError("mcpServers must be an object")
+        return config
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError(
+            f"Cannot update {path!r}: {exc}. Existing settings were left unchanged. "
+            "Repair this JSON file and run `harness install` again."
+        ) from exc
 
 
 def install_all(
@@ -39,6 +58,14 @@ def install_all(
         "skills": [],
         "backups": [],
     }
+
+    # Preflight every JSON config before copying runtime files or changing settings.
+    config_paths = [
+        os.path.join(home, ".claude.json"),
+        os.path.join(home, ".gemini", "config", "mcp_config.json"),
+        os.path.join(home, ".grok", "mcp.json"),
+    ]
+    configs = {path: _read_mcp_config(path) for path in config_paths}
 
     # 1. Install a permanent self-contained copy of the `harness` package into ~/.harness/lib/harness
     # so `harness` keeps working even if the user later deletes or moves the git clone folder!
@@ -124,48 +151,14 @@ exec "{py_posix}" -m harness.mcp_server "$@"
         "args": [],
     }
 
-    # 2. Register MCP Server in Claude Code (~/.claude.json)
-    claude_json_path = os.path.join(home, ".claude.json")
-    if os.path.exists(claude_json_path):
-        bak = _backup_file(claude_json_path)
-        if bak:
-            installed_items["backups"].append(bak)
-        try:
-            with open(claude_json_path, "r", encoding="utf-8") as fp:
-                claude_cfg = json.load(fp)
-        except Exception:
-            claude_cfg = {}
-    else:
-        claude_cfg = {}
-
-    if not isinstance(claude_cfg.get("mcpServers"), dict):
-        claude_cfg["mcpServers"] = {}
-    claude_cfg["mcpServers"]["one-agent-harness"] = mcp_entry
-    with open(claude_json_path, "w", encoding="utf-8") as fp:
-        json.dump(claude_cfg, fp, indent=2)
-    installed_items["mcp_configs"].append(claude_json_path)
-
-    # 3. Register MCP Server in Antigravity (~/.gemini/config/mcp_config.json)
-    agy_mcp_path = os.path.join(home, ".gemini", "config", "mcp_config.json")
-    os.makedirs(os.path.dirname(agy_mcp_path), exist_ok=True)
-    if os.path.isfile(agy_mcp_path) and os.path.getsize(agy_mcp_path) > 0:
-        bak = _backup_file(agy_mcp_path)
-        if bak:
-            installed_items["backups"].append(bak)
-        try:
-            with open(agy_mcp_path, "r", encoding="utf-8") as fp:
-                agy_cfg = json.load(fp)
-        except Exception:
-            agy_cfg = {}
-    else:
-        agy_cfg = {}
-
-    if not isinstance(agy_cfg.get("mcpServers"), dict):
-        agy_cfg["mcpServers"] = {}
-    agy_cfg["mcpServers"]["one-agent-harness"] = mcp_entry
-    with open(agy_mcp_path, "w", encoding="utf-8") as fp:
-        json.dump(agy_cfg, fp, indent=2)
-    installed_items["mcp_configs"].append(agy_mcp_path)
+    # Preserve and back up every JSON config, including Grok, before updating it.
+    for config_path, config in configs.items():
+        backup = _backup_file(config_path)
+        if backup:
+            installed_items["backups"].append(backup)
+        config.setdefault("mcpServers", {})["one-agent-harness"] = mcp_entry
+        atomic_write_text(config_path, json.dumps(config, indent=2) + "\n")
+        installed_items["mcp_configs"].append(config_path)
 
     # 4. Register MCP Server in Codex (~/.codex/config.toml)
     codex_dir = os.path.join(home, ".codex")
@@ -191,24 +184,6 @@ exec "{py_posix}" -m harness.mcp_server "$@"
         with open(codex_toml_path, "a", encoding="utf-8") as fp:
             fp.write(toml_block)
     installed_items["mcp_configs"].append(codex_toml_path)
-
-    # 5. Register MCP Server in Grok Build CLI (~/.grok/mcp.json)
-    grok_mcp_path = os.path.join(home, ".grok", "mcp.json")
-    os.makedirs(os.path.dirname(grok_mcp_path), exist_ok=True)
-    if os.path.isfile(grok_mcp_path) and os.path.getsize(grok_mcp_path) > 0:
-        try:
-            with open(grok_mcp_path, "r", encoding="utf-8") as fp:
-                grok_cfg = json.load(fp)
-        except Exception:
-            grok_cfg = {}
-    else:
-        grok_cfg = {}
-    if not isinstance(grok_cfg.get("mcpServers"), dict):
-        grok_cfg["mcpServers"] = {}
-    grok_cfg["mcpServers"]["one-agent-harness"] = mcp_entry
-    with open(grok_mcp_path, "w", encoding="utf-8") as fp:
-        json.dump(grok_cfg, fp, indent=2)
-    installed_items["mcp_configs"].append(grok_mcp_path)
 
     # 6. Install /handoff skill across all agents
     skill_src = os.path.join(root, "harness", "skills", "handoff", "SKILL.md")

@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import os
 import sys
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from harness.adapters import normalize_path
 
 from harness.engine import HarnessEngine
 from harness.platform_utils import is_pid_running, spawn_detached_process, terminate_pid
@@ -17,7 +19,7 @@ class ContextWatcher:
 
     def __init__(self, engine: Optional[HarnessEngine] = None) -> None:
         self.engine = engine or HarnessEngine()
-        self.last_seen: Dict[str, Tuple[str, float]] = {}  # cwd -> (session_id, mtime)
+        self.last_seen: Dict[str, Tuple[str, str, float]] = {}  # cwd -> (agent, session_id, mtime)
         self.pid_file = os.path.join(self.engine.harness_home, "watcher.pid")
         self.log_file = os.path.join(self.engine.harness_home, "watcher.log")
 
@@ -27,34 +29,49 @@ class ContextWatcher:
         update_agent_md: bool = True,
         force: bool = False,
     ) -> Optional[str]:
-        """Check for the newest session activity and sync .harness/LIVE_CONTEXT.md if changed."""
-        sessions = self.engine.list_sessions(cwd=cwd, limit=5)
-        if not sessions:
-            return None
+        """Sync all changed workspaces and return the last saved path, if any."""
+        paths = self.sync_changed_workspaces(cwd, update_agent_md, force)
+        return paths[-1] if paths else None
 
-        latest = sessions[0]
-        target_cwd = cwd or latest.cwd or os.getcwd()
-        prev = self.last_seen.get(target_cwd)
+    def sync_changed_workspaces(
+        self,
+        cwd: Optional[str] = None,
+        update_agent_md: bool = True,
+        force: bool = False,
+    ) -> List[str]:
+        """Sync the latest session in every workspace, without starving older ones."""
+        sessions = self.engine.list_sessions(cwd=cwd, limit=None)
+        newest_by_workspace = {}
+        for session in sessions:
+            target_cwd = normalize_path(session.cwd or cwd or self.engine.harness_home)
+            newest_by_workspace.setdefault(target_cwd, session)
 
-        if not force and prev and prev[0] == latest.session_id and prev[1] >= latest.mtime:
-            return None
-
-        bundle = self.engine.extract_bundle(
-            source_agent=latest.agent,
-            session_id=latest.session_id,
-            cwd=target_cwd,
-            max_turns=25,
-        )
-        if not bundle:
-            return None
-
-        live_path = self.engine.sync_workspace_context(
-            bundle,
-            target_cwd=target_cwd,
-            update_agent_md=update_agent_md,
-        )
-        self.last_seen[target_cwd] = (latest.session_id, latest.mtime)
-        return live_path
+        paths: List[str] = []
+        # Save oldest first so the global copy represents the newest activity.
+        for target_cwd, latest in reversed(list(newest_by_workspace.items())):
+            signature = (latest.agent, latest.session_id, latest.mtime)
+            if not force and self.last_seen.get(target_cwd) == signature:
+                continue
+            try:
+                bundle = self.engine.extract_session_bundle(
+                    latest, max_turns=25, include_other_sessions=False,
+                )
+                if not bundle:
+                    continue
+                live_path = self.engine.sync_workspace_context(
+                    bundle, target_cwd=target_cwd, update_agent_md=update_agent_md,
+                    update_global=(latest is sessions[0]),
+                )
+                for warning in self.engine.sync_warnings:
+                    print(f"[watcher] {warning}", file=sys.stderr, flush=True)
+                # A fallback save should be retried: the workspace may recover.
+                expected = os.path.join(target_cwd, ".harness", "LIVE_CONTEXT.md")
+                if live_path == expected or target_cwd == self.engine.harness_home:
+                    self.last_seen[target_cwd] = signature
+                paths.append(live_path)
+            except OSError as exc:
+                print(f"[watcher] Could not sync {target_cwd!r}: {exc}. Will retry.", file=sys.stderr, flush=True)
+        return paths
 
     def run_loop(
         self,
@@ -67,12 +84,12 @@ class ContextWatcher:
         iteration = 0
         while True:
             try:
-                synced_path = self.sync_once(
+                synced_paths = self.sync_changed_workspaces(
                     cwd=cwd,
                     update_agent_md=update_agent_md,
                     force=(iteration == 0),
                 )
-                if synced_path:
+                for synced_path in synced_paths:
                     now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
                     print(f"[{now_str}] Synced latest cross-agent context -> {synced_path}", flush=True)
             except Exception as exc:

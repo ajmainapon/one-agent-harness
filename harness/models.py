@@ -200,7 +200,8 @@ class ContextBundle:
                 turn_lines.append(f"> *Reasoning*: {thinking_short}\n")
             if turn.content.strip():
                 content_text = turn.content.strip()
-                if len(content_text) > 4000:
+                # User requirements must survive handoff intact, even in long prompts.
+                if turn.role != "user" and len(content_text) > 4000:
                     content_text = (
                         content_text[:1500]
                         + "\n\n... [intermediate steps omitted] ...\n\n"

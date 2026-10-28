@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from harness.adapters.claude import ClaudeAdapter
 from harness.adapters.codex import CodexAdapter
 from harness.adapters.grok import GrokAdapter
 from harness.models import ContextBundle, SessionSummary
-from harness.platform_utils import get_default_agent_homes
+from harness.platform_utils import atomic_write_text, get_default_agent_homes
 
 
 MARKER_START = "<!-- ONE-AGENT-HARNESS:START -->"
@@ -79,14 +80,14 @@ class HarnessEngine:
             "grok": GrokAdapter(grok_home=grok_home),
         }
         self.harness_home = os.path.expanduser(harness_home or get_default_agent_homes()["harness"])
-        os.makedirs(self.harness_home, exist_ok=True)
+        self.sync_warnings: List[str] = []
         self.checkpoints_file = os.path.join(self.harness_home, "checkpoints.jsonl")
 
     def list_sessions(
         self,
         agent: Optional[str] = None,
         cwd: Optional[str] = None,
-        limit: int = 20,
+        limit: Optional[int] = 20,
         exclude_agent: Optional[str] = None,
         include_meta: bool = False,
     ) -> List[SessionSummary]:
@@ -94,6 +95,8 @@ class HarnessEngine:
         results: List[SessionSummary] = []
         norm_agent = normalize_agent_name(agent)
         norm_exclude = normalize_agent_name(exclude_agent)
+        if norm_agent and norm_agent not in self.adapters:
+            raise ValueError(f"Unknown agent {agent!r}. Choose claude, antigravity, codex, or grok.")
         target_agents = [norm_agent] if norm_agent else list(self.adapters.keys())
 
         for ag in target_agents:
@@ -102,7 +105,7 @@ class HarnessEngine:
             adapter = self.adapters.get(ag)
             if not adapter:
                 continue
-            for s in adapter.list_sessions(cwd=cwd, limit=limit * 2):
+            for s in adapter.list_sessions(cwd=cwd, limit=None):
                 if not include_meta and s.is_meta_session:
                     continue
                 results.append(s)
@@ -127,65 +130,51 @@ class HarnessEngine:
             norm_agent = AGENT_ALIASES[sel.lower()]
             sel = ""
 
+        effective_cwd = None if is_scratch_cwd(cwd) else cwd
         all_sessions = self.list_sessions(
             agent=norm_agent,
-            cwd=None,
-            limit=50,
+            cwd=effective_cwd,
+            limit=None,
             exclude_agent=norm_exclude if not norm_agent else None,
-            include_meta=False,
         )
-        if not all_sessions:
-            all_sessions = self.list_sessions(
-                agent=norm_agent,
-                cwd=None,
-                limit=20,
-                exclude_agent=norm_exclude if not norm_agent else None,
-                include_meta=True,
-            )
-
         if not sel:
-            effective_cwd_filter = None if is_scratch_cwd(cwd) else cwd
-            if effective_cwd_filter:
-                cwd_matches = self.list_sessions(
-                    agent=norm_agent,
-                    cwd=effective_cwd_filter,
-                    limit=5,
-                    exclude_agent=norm_exclude if not norm_agent else None,
-                    include_meta=False,
-                )
-                if cwd_matches:
-                    return cwd_matches[0]
             return all_sessions[0] if all_sessions else None
 
-        # 1. Check 1-based index number ("1", "2", "#3")
+        # Numbers always refer to the same filtered list shown by status/MCP.
         idx_str = sel.lstrip("#")
         if idx_str.isdigit():
             idx = int(idx_str)
-            if 1 <= idx <= len(all_sessions):
-                return all_sessions[idx - 1]
+            return all_sessions[idx - 1] if 1 <= idx <= len(all_sessions) else None
 
-        # 2. Check exact or prefix session_id match
         sel_lower = sel.lower()
-        for s in all_sessions:
-            if s.session_id.lower().startswith(sel_lower) or sel_lower in s.session_id.lower():
-                return s
+        # Explicit IDs may address synthetic handoffs omitted from the dashboard.
+        id_candidates = self.list_sessions(
+            agent=norm_agent, cwd=effective_cwd, limit=None,
+            exclude_agent=norm_exclude if not norm_agent else None, include_meta=True,
+        )
+        for session in id_candidates:
+            if session.session_id.lower() == sel_lower:
+                return session
+        id_matches = [s for s in id_candidates if s.session_id.lower().startswith(sel_lower)]
+        if len(id_matches) == 1:
+            return id_matches[0]
+        if len(id_matches) > 1:
+            raise ValueError(f"Session ID prefix {sel!r} is ambiguous. Use a longer ID from `harness status`.")
 
-        # 3. Fuzzy match against title or workspace path (all words present)
-        words = [w for w in sel_lower.split() if w]
-        for s in all_sessions:
-            haystack = f"{s.title} {s.cwd} {s.agent}".lower()
-            if all(w in haystack for w in words):
-                return s
+        words = sel_lower.split()
+        for session in all_sessions:
+            haystack = f"{session.title} {session.cwd} {session.agent}".lower()
+            if all(word in haystack for word in words):
+                return session
 
-        # 4. Any word match or full-text search
-        matches = self.search_history(query=sel, agent=norm_agent, limit=1)
+        # Search only the selected scope; an unrelated newer match must not hide it.
+        matches = self.search_history(
+            query=sel, agent=norm_agent, limit=1, sessions=all_sessions,
+        )
         if matches:
-            m_sid = matches[0]["session_id"]
-            m_ag = matches[0]["agent"]
-            for s in all_sessions:
-                if s.session_id == m_sid and s.agent == m_ag:
-                    return s
-
+            match = matches[0]
+            return next((s for s in all_sessions if s.session_id == match["session_id"]
+                         and s.agent == match["agent"]), None)
         return None
 
     def save_checkpoint(
@@ -204,6 +193,7 @@ class HarnessEngine:
             "summary": summary.strip(),
             "next_steps": next_steps.strip(),
         }
+        os.makedirs(self.harness_home, exist_ok=True)
         with open(self.checkpoints_file, "a", encoding="utf-8") as fp:
             fp.write(json.dumps(entry) + "\n")
         return entry
@@ -251,36 +241,31 @@ class HarnessEngine:
             exclude_agent=exclude_agent,
         )
 
-        if resolved:
-            chosen_agent = resolved.agent
-            chosen_sid = resolved.session_id
-        else:
-            chosen_agent = normalize_agent_name(source_agent)
-            chosen_sid = session_id
-
-        if not chosen_agent:
+        # Never silently change the requested source when resolution fails.
+        if not resolved:
             return None
+        return self.extract_session_bundle(resolved, max_turns=max_turns)
 
-        adapter = self.adapters.get(chosen_agent)
-        if not adapter:
-            return None
-
-        effective_cwd_filter = None if (chosen_sid or is_scratch_cwd(cwd)) else cwd
+    def extract_session_bundle(
+        self,
+        resolved: SessionSummary,
+        max_turns: int = 25,
+        include_other_sessions: bool = True,
+    ) -> Optional[ContextBundle]:
+        """Extract an already selected session without rediscovering all history."""
+        adapter = self.adapters[resolved.agent]
         bundle = adapter.extract_bundle(
-            session_id=chosen_sid,
-            cwd=effective_cwd_filter,
+            session_id=resolved.session_id,
             max_turns=max_turns,
         )
-        if not bundle and effective_cwd_filter:
-            bundle = adapter.extract_bundle(
-                session_id=chosen_sid,
-                cwd=None,
-                max_turns=max_turns,
-            )
         if not bundle:
             return None
 
         bundle.checkpoint_notes = self._load_recent_checkpoints(cwd=bundle.cwd)
+
+        if not include_other_sessions:
+            bundle.generate_distilled_summary()
+            return bundle
 
         # Populate other recent substantive sessions across all platforms
         all_recent = self.list_sessions(cwd=None, limit=12, include_meta=False)
@@ -321,39 +306,54 @@ class HarnessEngine:
         bundle: ContextBundle,
         target_cwd: Optional[str] = None,
         update_agent_md: bool = False,
+        update_global: bool = True,
     ) -> str:
-        """Write .harness/LIVE_CONTEXT.md and .harness/bundle.json into the workspace."""
+        """Save context, falling back to harness home if the workspace is unavailable.
+
+        Nonfatal problems are exposed through sync_warnings. If neither location
+        can be written, readers can still return the in-memory bundle.
+        """
+        self.sync_warnings = []
         candidate_cwd = target_cwd if (target_cwd and not is_scratch_cwd(target_cwd)) else bundle.cwd
         effective_cwd = normalize_path(candidate_cwd or "")
-        if (
-            not effective_cwd
-            or is_scratch_cwd(effective_cwd)
-            or not os.path.isdir(effective_cwd)
-            or not os.access(effective_cwd, os.W_OK)
-        ):
+        # Older workspace fallbacks must not replace the watcher's newest global context.
+        fallback_dir = self.harness_home
+        if not update_global:
+            workspace_key = hashlib.sha256(effective_cwd.encode("utf-8")).hexdigest()[:16]
+            fallback_dir = os.path.join(self.harness_home, "workspaces", workspace_key)
+        if not effective_cwd or is_scratch_cwd(effective_cwd):
+            effective_cwd = self.harness_home
+        elif not os.path.isdir(effective_cwd):
+            self.sync_warnings.append(f"Workspace {effective_cwd!r} is unavailable; saving in {fallback_dir!r}.")
             effective_cwd = self.harness_home
 
-        harness_dir = (
-            self.harness_home
-            if effective_cwd == self.harness_home
-            else os.path.join(effective_cwd, ".harness")
-        )
-        os.makedirs(harness_dir, exist_ok=True)
+        md_content = bundle.to_markdown(include_full_artifacts=True, max_turns=0)
+        json_content = json.dumps(bundle.to_dict(), indent=2)
 
-        md_path = os.path.join(harness_dir, "LIVE_CONTEXT.md")
-        json_path = os.path.join(harness_dir, "bundle.json")
+        def save(directory: str) -> str:
+            atomic_write_text(os.path.join(directory, "bundle.json"), json_content)
+            path = os.path.join(directory, "LIVE_CONTEXT.md")
+            atomic_write_text(path, md_content)
+            return path
 
-        md_content = bundle.to_markdown(include_full_artifacts=True, max_turns=25)
-        with open(md_path, "w", encoding="utf-8") as fp:
-            fp.write(md_content)
-
-        with open(json_path, "w", encoding="utf-8") as fp:
-            json.dump(bundle.to_dict(), fp, indent=2)
+        harness_dir = fallback_dir if effective_cwd == self.harness_home else os.path.join(effective_cwd, ".harness")
+        try:
+            md_path = save(harness_dir)
+        except OSError as exc:
+            if effective_cwd == self.harness_home:
+                raise
+            self.sync_warnings.append(
+                f"Could not save context in {harness_dir!r}: {exc}. Saving in {fallback_dir!r} instead."
+            )
+            effective_cwd = self.harness_home
+            md_path = save(fallback_dir)
 
         global_md = os.path.join(self.harness_home, "LIVE_CONTEXT.md")
-        if os.path.abspath(md_path) != os.path.abspath(global_md):
-            with open(global_md, "w", encoding="utf-8") as fp:
-                fp.write(md_content)
+        if update_global and os.path.abspath(md_path) != os.path.abspath(global_md):
+            try:
+                atomic_write_text(global_md, md_content)
+            except OSError as exc:
+                self.sync_warnings.append(f"Workspace context was saved, but the global copy could not be updated: {exc}.")
 
         if update_agent_md and effective_cwd != self.harness_home:
             pointer_block = (
@@ -376,10 +376,9 @@ class HarnessEngine:
                             updated = existing[:start_idx] + pointer_block.strip() + existing[end_idx:]
                         else:
                             updated = existing.rstrip() + "\n\n" + pointer_block
-                        with open(fpath, "w", encoding="utf-8") as fp:
-                            fp.write(updated)
-                    except OSError:
-                        pass
+                        atomic_write_text(fpath, updated)
+                    except OSError as exc:
+                        self.sync_warnings.append(f"Could not update {fpath!r}: {exc}.")
 
         return md_path
 
@@ -407,10 +406,13 @@ class HarnessEngine:
             query=query,
         )
         if not bundle:
-            raise RuntimeError("No source session found to hand off.")
+            raise RuntimeError("No matching source session found. Run `harness status` with the same filters, then use a session ID or number.")
 
         effective_cwd = normalize_path(cwd or bundle.cwd or os.getcwd())
-        live_path = self.sync_workspace_context(bundle, target_cwd=effective_cwd, update_agent_md=True)
+        self.sync_warnings = []
+        live_path = None
+        if not dry_run:
+            live_path = self.sync_workspace_context(bundle, target_cwd=effective_cwd, update_agent_md=True)
 
         injected_id = "dry-run"
         if not dry_run:
@@ -422,7 +424,7 @@ class HarnessEngine:
         elif target == "codex":
             launch_cmd = ["codex", "resume", injected_id]
         elif target == "grok":
-            launch_cmd = ["grok", f"Continue from handoff context in {live_path}"]
+            launch_cmd = ["grok", f"Continue from handoff context in {live_path or '<context-file>'}"]
         elif target == "antigravity":
             launch_cmd = ["agy", effective_cwd]
 
@@ -435,6 +437,7 @@ class HarnessEngine:
             "live_context_path": live_path,
             "launch_cmd": launch_cmd,
             "bundle": bundle,
+            "warnings": list(self.sync_warnings),
         }
 
     def search_history(
@@ -442,11 +445,15 @@ class HarnessEngine:
         query: str,
         agent: Optional[str] = None,
         limit: int = 15,
+        sessions: Optional[List[SessionSummary]] = None,
     ) -> List[Dict[str, Any]]:
         """Search across all 4 agents' conversation turns, titles, and modified files."""
         q_lower = query.lower().strip()
         matches: List[Dict[str, Any]] = []
-        sessions = self.list_sessions(agent=agent, limit=60, include_meta=False)
+        if not q_lower:
+            return []
+        if sessions is None:
+            sessions = self.list_sessions(agent=agent, limit=60, include_meta=False)
 
         for sess in sessions:
             if q_lower in sess.title.lower() or q_lower in sess.cwd.lower():

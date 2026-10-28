@@ -99,13 +99,39 @@ harness copy                  # Copy #1 latest session
 harness copy 2                # Copy session #2
 harness copy "auth"           # Copy session matching "auth"
 
+# Read context without writing files or changing your clipboard
+harness handoff "auth refactor" --read-only
+
+# Preview a switch without changing files or clipboard
+harness codex "auth refactor" --dry-run
+
 # Search across all 4 platforms' transcripts & touched files
 harness search "keyword"
 ```
 
 ---
 
-### 3. Environment Variable Overrides
+### 3. Selecting the Right Session
+
+Use the same filters when listing and selecting sessions:
+
+```bash
+harness status --agent claude --cwd /path/to/project
+harness handoff 1 --from claude --cwd /path/to/project
+```
+
+Numbers refer to the filtered list and may change when new sessions become active. Use `--session <session-id>` for a stable selection. A query or workspace with no match reports an error instead of loading an unrelated project. With no filters, the latest substantive session is selected.
+
+### 4. Saving and Recovery
+
+- Handoffs save to `.harness/LIVE_CONTEXT.md` and `.harness/bundle.json` in the workspace. If the workspace cannot be written, Harness reports the fallback location under `~/.harness`.
+- If neither location is writable, CLI and MCP still return the extracted context with a warning. `--read-only` prints context without attempting a save or clipboard change.
+- Use `--no-update-agent-md` to save a handoff without updating existing `AGENTS.md` or `CLAUDE.md` pointers. Use `--no-copy` to leave your clipboard unchanged.
+- The watcher syncs the latest session in each workspace and retries failed saves. One unavailable workspace does not block the others.
+- User prompts are preserved in full within the selected turns. Long assistant responses and artifacts may still be shortened. Claude plans are included only when the session explicitly read or modified them.
+- Installation validates existing JSON settings before making changes and backs up every existing MCP JSON config, including Grok. If a config is malformed, repair the indicated file and rerun `harness install`; the original is left unchanged.
+
+### 5. Environment Variable Overrides
 
 All storage paths default to standard user home directories on Linux, macOS, and Windows (`~` / `%USERPROFILE%`), and can be customized via environment variables:
 

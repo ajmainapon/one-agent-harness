@@ -273,10 +273,15 @@ class MCPServer:
                 query=query,
             )
             if not bundle:
-                return "No sessions found across Claude Code, Antigravity, Codex, or Grok Build CLI."
+                raise ValueError("No matching session found. Call list_recent_sessions with the same agent/workspace filters, then use its session ID or number.")
 
-            self.engine.sync_workspace_context(bundle, target_cwd=cwd or bundle.cwd, update_agent_md=False)
-            return bundle.to_markdown(include_full_artifacts=True, max_turns=max_turns)
+            try:
+                self.engine.sync_workspace_context(bundle, target_cwd=cwd or bundle.cwd, update_agent_md=False)
+                warnings = list(self.engine.sync_warnings)
+            except OSError as exc:
+                warnings = [f"Context was loaded, but could not be saved: {exc}. You can continue using the transcript below."]
+            notice = "".join(f"> Sync warning: {warning}\n\n" for warning in warnings)
+            return notice + bundle.to_markdown(include_full_artifacts=True, max_turns=max_turns)
 
         if name == "list_recent_sessions":
             raw_cwd = args.get("cwd")

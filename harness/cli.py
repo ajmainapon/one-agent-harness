@@ -9,6 +9,7 @@ import subprocess
 import sys
 from typing import List, Optional
 
+from harness import __version__
 from harness.engine import AGENT_ALIASES, HarnessEngine, normalize_agent_name
 from harness.formatting import Colors, agent_badge, relative_time, shorten_path, style
 from harness.installer import install_all
@@ -21,7 +22,7 @@ def _copy_to_clipboard(text: str) -> bool:
     return copy_to_clipboard(text)
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace, sessions=None) -> int:
     engine = HarnessEngine()
     watcher = ContextWatcher(engine)
     d_status = watcher.daemon_status()
@@ -46,9 +47,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     print()
 
-    sessions = engine.list_sessions(agent=args.agent, cwd=args.cwd, limit=args.limit)
+    if sessions is None:
+        sessions = engine.list_sessions(agent=args.agent, cwd=args.cwd, limit=args.limit)
     if not sessions:
-        print("  No matching sessions found.")
+        print("  No matching sessions found. Start a conversation in a supported agent, or check your --agent / --cwd filters.")
         return 0
 
     print(style(f"  Recent Sessions (use #number or keyword in any command):", Colors.BOLD))
@@ -79,7 +81,7 @@ def cmd_pick(args: argparse.Namespace) -> int:
         print("No sessions found.")
         return 1
 
-    cmd_status(argparse.Namespace(agent=None, cwd=None, limit=10))
+    cmd_status(argparse.Namespace(agent=None, cwd=None, limit=12), sessions=sessions)
     print()
     try:
         raw_choice = input(style("Select session # or keyword [default=1, q=quit]: ", Colors.BOLD, Colors.CYAN)).strip()
@@ -91,7 +93,12 @@ def cmd_pick(args: argparse.Namespace) -> int:
         return 0
     selector = raw_choice or "1"
 
-    resolved = engine.resolve_session(selector=selector)
+    index = selector.lstrip("#")
+    if index.isdigit():
+        number = int(index)
+        resolved = sessions[number - 1] if 1 <= number <= len(sessions) else None
+    else:
+        resolved = engine.resolve_session(selector=selector)
     if not resolved:
         print(f"Could not find session matching '{selector}'.")
         return 1
@@ -167,22 +174,30 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         query=query_val or None,
     )
     if not bundle:
-        print("Error: Could not find a matching session to extract.", file=sys.stderr)
+        print("No matching session found. Run `harness status` with the same filters, then use a session ID or number.", file=sys.stderr)
         return 1
 
-    target_cwd = args.cwd or bundle.cwd or os.getcwd()
-    live_path = engine.sync_workspace_context(
-        bundle,
-        target_cwd=target_cwd,
-        update_agent_md=args.update_agent_md,
-    )
+    read_only = getattr(args, "read_only", False)
+    live_path = None
+    if not read_only:
+        try:
+            live_path = engine.sync_workspace_context(
+                bundle, target_cwd=args.cwd or bundle.cwd,
+                update_agent_md=args.update_agent_md,
+            )
+            for warning in engine.sync_warnings:
+                print(f"Warning: {warning}", file=sys.stderr)
+        except OSError as exc:
+            print(f"Warning: Context loaded, but could not be saved: {exc}.", file=sys.stderr)
     md_text = bundle.to_markdown(include_full_artifacts=True, max_turns=args.max_turns)
 
     copied = False
-    if args.copy:
+    if args.copy and not read_only:
         copied = _copy_to_clipboard(md_text)
+        if not copied:
+            print("Clipboard unavailable. Use `harness handoff --read-only` to print context, or open the saved context file.", file=sys.stderr)
 
-    if args.stdout:
+    if args.stdout or read_only or (not live_path and not copied):
         print(md_text)
     else:
         print(
@@ -194,9 +209,10 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         print(f"  • Turns Preserved  : {len(bundle.turns)} (of {bundle.total_turn_count or len(bundle.turns)})")
         print(f"  • Plans/Artifacts  : {len(bundle.artifacts_and_plans)}")
         print(f"  • Files Modified   : {len(bundle.files_modified)}")
-        print(f"  • Live Sync File   : `{shorten_path(live_path)}`")
+        if live_path:
+            print(f"  • Live Sync File   : `{shorten_path(live_path)}`")
         if copied:
-            print(f"  • Clipboard        : {style('Copied full handoff context to macOS clipboard (press Cmd+V anywhere!)', Colors.CYAN)}")
+            print(f"  • Clipboard        : {style('Copied context to your system clipboard', Colors.CYAN)}")
     return 0
 
 
@@ -221,16 +237,23 @@ def cmd_switch(args: argparse.Namespace) -> int:
     launch_cmd: List[str] = res["launch_cmd"]
     cmd_str = " ".join(launch_cmd)
 
-    print(style("✔ Cross-Agent Session Switch Ready", Colors.GREEN, Colors.BOLD))
+    for warning in res["warnings"]:
+        print(f"Warning: {warning}", file=sys.stderr)
+    heading = "Preview — no files or clipboard changed" if args.dry_run else "✔ Cross-Agent Session Switch Ready"
+    print(style(heading, Colors.GREEN, Colors.BOLD))
     print(f"  • From             : {agent_badge(res['source_agent'])} {style(bundle.title, Colors.BOLD)}")
-    print(f"  • To               : {agent_badge(res['target_agent'])} (Native ID: `{res['injected_session_id']}`)")
+    print(f"  • To               : {agent_badge(res['target_agent'])}")
     print(f"  • Workspace Folder : `{shorten_path(res['cwd'])}`")
-    print(f"  • Live Context File: `{shorten_path(res['live_context_path'])}`")
-    print(f"  • Resume Command   : `{style(cmd_str, Colors.BOLD, Colors.CYAN)}`")
+    if res["live_context_path"]:
+        print(f"  • Live Context File: `{shorten_path(res['live_context_path'])}`")
+    if not args.dry_run:
+        print(f"  • Resume Command   : `{style(cmd_str, Colors.BOLD, Colors.CYAN)}`")
 
-    if args.copy:
-        _copy_to_clipboard(bundle.to_markdown(include_full_artifacts=True, max_turns=args.max_turns))
-        print("  • Clipboard        : Copied full handoff markdown to macOS clipboard")
+    if args.copy and not args.dry_run:
+        if _copy_to_clipboard(bundle.to_markdown(include_full_artifacts=True, max_turns=args.max_turns)):
+            print("  • Clipboard        : Copied context to your system clipboard")
+        else:
+            print("Clipboard unavailable. Your context is saved in the file above.", file=sys.stderr)
 
     if args.dry_run or args.no_launch:
         return 0
@@ -244,6 +267,9 @@ def cmd_switch(args: argparse.Namespace) -> int:
         return 0
 
     print(f"\nLaunching `{cmd_str}` in {res['cwd']}...\n")
+    if not os.path.isdir(res["cwd"]):
+        print(f"Cannot launch: workspace {res['cwd']!r} no longer exists. Context is saved; use --cwd with an existing workspace.", file=sys.stderr)
+        return 1
     os.chdir(res["cwd"])
     os.execvp(bin_path, launch_cmd)
     return 0
@@ -322,18 +348,40 @@ def cmd_install(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("enter a positive whole number")
+    if number < 1:
+        raise argparse.ArgumentTypeError("enter a positive whole number")
+    return number
+
+
+def _positive_interval(value: str) -> float:
+    import math
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("enter a positive number of seconds")
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("enter a positive number of seconds")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="harness",
         description="One Agent Harness: Universal Cross-Agent Context Bridge for Claude Code, Antigravity, Codex & Grok Build CLI.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command")
 
     # status
     p_status = sub.add_parser("status", aliases=["ls", "list"], help="List recent sessions across all 4 agents")
     p_status.add_argument("--agent", "-a", help="Filter by agent ('claude', 'antigravity', 'codex', 'grok')")
     p_status.add_argument("--cwd", help="Filter by workspace path")
-    p_status.add_argument("--limit", "-n", type=int, default=12, help="Max sessions to display")
+    p_status.add_argument("--limit", "-n", type=_positive_int, default=12, help="Max sessions to display")
     p_status.set_defaults(func=cmd_status)
 
     # pick / menu
@@ -347,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_copy.add_argument("--from", dest="source_agent", help="Source agent")
     p_copy.add_argument("--session", help="Specific session ID prefix")
     p_copy.add_argument("--cwd", help="Workspace directory filter")
-    p_copy.add_argument("--max-turns", type=int, default=25, help="Max verbatim turns")
+    p_copy.add_argument("--max-turns", type=_positive_int, default=25, help="Max verbatim turns")
     p_copy.set_defaults(
         func=lambda a: cmd_handoff(
             argparse.Namespace(
@@ -369,11 +417,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_handoff.add_argument("--from", dest="source_agent", help="Source agent")
     p_handoff.add_argument("--session", help="Specific session ID prefix")
     p_handoff.add_argument("--cwd", help="Workspace directory filter/target")
-    p_handoff.add_argument("--max-turns", type=int, default=25, help="Max verbatim turns to include")
+    p_handoff.add_argument("--max-turns", type=_positive_int, default=25, help="Max verbatim turns to include")
     p_handoff.add_argument("--stdout", action="store_true", help="Print the full Markdown bundle to stdout")
     p_handoff.add_argument("--copy", action="store_true", default=True, help="Copy Markdown bundle to clipboard (default: True)")
     p_handoff.add_argument("--no-copy", dest="copy", action="store_false", help="Do not copy to clipboard")
     p_handoff.add_argument("--update-agent-md", action="store_true", default=True, help="Update AGENTS.md/CLAUDE.md pointer if present")
+    p_handoff.add_argument("--no-update-agent-md", dest="update_agent_md", action="store_false", help="Leave AGENTS.md and CLAUDE.md unchanged")
+    p_handoff.add_argument("--read-only", action="store_true", help="Print context without saving files or changing the clipboard")
     p_handoff.set_defaults(func=cmd_handoff)
 
     # switch / to
@@ -383,9 +433,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_switch.add_argument("--from", dest="from_agent", help="Source agent (auto-detected if omitted)")
     p_switch.add_argument("--session", help="Specific source session ID prefix")
     p_switch.add_argument("--cwd", help="Workspace directory")
-    p_switch.add_argument("--max-turns", type=int, default=25, help="Max verbatim turns to include")
+    p_switch.add_argument("--max-turns", type=_positive_int, default=25, help="Max verbatim turns to include")
     p_switch.add_argument("--no-launch", action="store_true", help="Inject session natively without launching the CLI")
-    p_switch.add_argument("--dry-run", action="store_true", help="Preview conversion without writing target session")
+    p_switch.add_argument("--dry-run", action="store_true", help="Preview conversion without changing files or clipboard")
     p_switch.add_argument("--copy", action="store_true", default=True, help="Also copy handoff markdown to clipboard")
     p_switch.add_argument("--no-copy", dest="copy", action="store_false", help="Do not copy to clipboard")
     p_switch.set_defaults(func=cmd_switch)
@@ -403,9 +453,9 @@ def build_parser() -> argparse.ArgumentParser:
         p_sh.add_argument("--from", dest="from_agent", help="Optional source agent")
         p_sh.add_argument("--session", help="Optional session ID")
         p_sh.add_argument("--cwd", help="Optional workspace directory")
-        p_sh.add_argument("--max-turns", type=int, default=25, help="Max verbatim turns")
+        p_sh.add_argument("--max-turns", type=_positive_int, default=25, help="Max verbatim turns")
         p_sh.add_argument("--no-launch", action="store_true", help="Inject session natively without launching CLI")
-        p_sh.add_argument("--dry-run", action="store_true", help="Preview conversion without writing target session")
+        p_sh.add_argument("--dry-run", action="store_true", help="Preview conversion without changing files or clipboard")
         p_sh.add_argument("--copy", action="store_true", default=True, help="Copy context to clipboard")
         p_sh.add_argument("--no-copy", dest="copy", action="store_false", help="Do not copy to clipboard")
         p_sh.set_defaults(func=cmd_switch, to_agent=canonical_target)
@@ -415,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--daemon", action="store_true", help="Run watcher in the background")
     p_watch.add_argument("--stop", action="store_true", help="Stop background watcher daemon")
     p_watch.add_argument("--status", action="store_true", help="Check background watcher daemon status")
-    p_watch.add_argument("--interval", type=float, default=2.0, help="Polling interval in seconds")
+    p_watch.add_argument("--interval", type=_positive_interval, default=2.0, help="Polling interval in seconds")
     p_watch.add_argument("--cwd", help="Optional specific workspace directory to watch")
     p_watch.set_defaults(func=cmd_watch)
 
@@ -423,7 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_search = sub.add_parser("search", aliases=["find"], help="Search across all 4 agents' conversation history and modified files")
     p_search.add_argument("query", nargs="+", help="Keyword, filename, or phrase to search")
     p_search.add_argument("--agent", "-a", help="Optional agent filter")
-    p_search.add_argument("--limit", "-n", type=int, default=15, help="Max results")
+    p_search.add_argument("--limit", "-n", type=_positive_int, default=15, help="Max results")
     p_search.set_defaults(func=cmd_search)
 
     # checkpoint
@@ -464,7 +514,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("Error: specify target agent (e.g. `harness codex 3` or `harness switch --to codex`).", file=sys.stderr)
             return 1
 
-    return int(args.func(args) or 0)
+    try:
+        return int(args.func(args) or 0)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

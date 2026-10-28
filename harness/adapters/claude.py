@@ -178,7 +178,7 @@ class ClaudeAdapter(BaseAdapter):
             is_meta_session=is_meta,
         )
 
-    def list_sessions(self, cwd: Optional[str] = None, limit: int = 20) -> List[SessionSummary]:
+    def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         results: List[SessionSummary] = []
         for fpath in self._iter_jsonl_files():
             summary = self._quick_scan_file(fpath)
@@ -187,7 +187,7 @@ class ClaudeAdapter(BaseAdapter):
             if cwd and not paths_match(cwd, summary.cwd):
                 continue
             results.append(summary)
-            if len(results) >= limit:
+            if limit is not None and len(results) >= limit:
                 break
         return results
 
@@ -292,7 +292,8 @@ class ClaudeAdapter(BaseAdapter):
         initial_goal = all_user_turns[0] if all_user_turns else ""
         latest_user_req = all_user_turns[-1] if all_user_turns else ""
 
-        # Attach recent Claude plans if present
+        # Only attach plans explicitly touched by this session. Modification time
+        # alone cannot associate a global plans directory with a project.
         artifacts: List[ArtifactDoc] = []
         if os.path.isdir(self.plans_dir):
             plan_files = sorted(
@@ -300,8 +301,9 @@ class ClaudeAdapter(BaseAdapter):
                 key=os.path.getmtime,
                 reverse=True,
             )
-            for pf in plan_files[:2]:
-                if abs(os.path.getmtime(pf) - mtime) <= 86400 or any(pf in m for m in files_modified + files_read):
+            touched_paths = {normalize_path(p) for p in files_modified + files_read}
+            for pf in plan_files:
+                if normalize_path(pf) in touched_paths:
                     try:
                         with open(pf, "r", encoding="utf-8", errors="replace") as pfp:
                             artifacts.append(

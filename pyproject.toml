@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "one-agent-harness"
-version = "0.2.0"
+version = "0.2.1"
 description = "Universal Cross-Agent Context Bridge uniting Claude Code, Antigravity, OpenAI Codex, and Grok Build CLI across Linux, macOS, and Windows."
 readme = "README.md"
 requires-python = ">=3.9"

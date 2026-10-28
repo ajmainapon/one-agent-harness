@@ -236,7 +236,7 @@ class AntigravityAdapter(BaseAdapter):
             is_meta_session=is_meta,
         )
 
-    def list_sessions(self, cwd: Optional[str] = None, limit: int = 20) -> List[SessionSummary]:
+    def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         db_meta = self._load_db_metadata()
         results: List[SessionSummary] = []
         for fpath in self._iter_transcript_files():
@@ -246,7 +246,7 @@ class AntigravityAdapter(BaseAdapter):
             if cwd and not paths_match(cwd, summary.cwd):
                 continue
             results.append(summary)
-            if len(results) >= limit:
+            if limit is not None and len(results) >= limit:
                 break
         return results
 

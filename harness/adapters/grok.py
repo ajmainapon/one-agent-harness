@@ -41,7 +41,7 @@ class GrokAdapter(BaseAdapter):
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return candidates
 
-    def list_sessions(self, cwd: Optional[str] = None, limit: int = 20) -> List[SessionSummary]:
+    def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         results: List[SessionSummary] = []
         for fpath in self._iter_session_files():
             try:
@@ -102,7 +102,7 @@ class GrokAdapter(BaseAdapter):
                     is_meta_session=is_meta,
                 )
             )
-            if len(results) >= limit:
+            if limit is not None and len(results) >= limit:
                 break
         return results
 

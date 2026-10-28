@@ -20,9 +20,11 @@ Use this skill whenever the user wants to:
 2. **Fallback via CLI (works immediately on Linux, macOS, and Windows without restarting the app)**:
    - Run:
      ```bash
-     harness handoff --stdout --no-copy || ~/.local/bin/harness handoff --stdout --no-copy
+     harness handoff --read-only || ~/.local/bin/harness handoff --read-only
      ```
-     *(Or pass a query/number/platform directly: `harness handoff "auth refactor" --stdout --no-copy` or `harness handoff 2 --stdout --no-copy`; on Windows PowerShell/CMD: `harness handoff --stdout --no-copy` or `"$HOME\.local\bin\harness.cmd" handoff --stdout --no-copy`).*
+     *(Or pass a query/number/platform directly: `harness handoff "auth refactor" --read-only` or `harness handoff 2 --read-only`; on Windows PowerShell/CMD: `harness handoff --read-only` or `"$HOME\.local\bin\harness.cmd" handoff --read-only`).*
+   - A missing match is an error, not permission to load another project. List recent sessions with the same agent/workspace filters and select the intended session by ID. Numbers refer to that filtered list and can change as new activity arrives.
+   - Context may still be returned with a save warning. Use the returned transcript; a workspace write failure does not invalidate the extracted context.
 
 ## Step 2: Assimilate & Resume Seamlessly
 

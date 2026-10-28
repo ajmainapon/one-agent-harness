@@ -11,12 +11,29 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from typing import Dict, List, Optional
 
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    """Replace a text file only after the complete new contents are written."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".harness-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fp:
+            fp.write(content)
+        if os.path.isfile(path):
+            os.chmod(temp_path, os.stat(path).st_mode & 0o777)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def is_wsl() -> bool:
