@@ -20,6 +20,7 @@ class ContextWatcher:
     def __init__(self, engine: Optional[HarnessEngine] = None) -> None:
         self.engine = engine or HarnessEngine()
         self.last_seen: Dict[str, Tuple[str, str, float]] = {}  # cwd -> (agent, session_id, mtime)
+        self.fallback_seen: Dict[str, Tuple[Tuple[str, str, float], bool]] = {}
         self.pid_file = os.path.join(self.engine.harness_home, "watcher.pid")
         self.log_file = os.path.join(self.engine.harness_home, "watcher.log")
 
@@ -50,8 +51,12 @@ class ContextWatcher:
         # Save oldest first so the global copy represents the newest activity.
         for target_cwd, latest in reversed(list(newest_by_workspace.items())):
             signature = (latest.agent, latest.session_id, latest.mtime)
-            if not force and self.last_seen.get(target_cwd) == signature:
-                continue
+            dir_exists = os.path.isdir(target_cwd)
+            if not force:
+                if self.last_seen.get(target_cwd) == signature:
+                    continue
+                if self.fallback_seen.get(target_cwd) == (signature, dir_exists):
+                    continue
             try:
                 bundle = self.engine.extract_session_bundle(
                     latest, max_turns=25, include_other_sessions=False,
@@ -64,10 +69,14 @@ class ContextWatcher:
                 )
                 for warning in self.engine.sync_warnings:
                     print(f"[watcher] {warning}", file=sys.stderr, flush=True)
-                # A fallback save should be retried: the workspace may recover.
+                # Track primary saves in last_seen and fallback saves in fallback_seen
+                # so unavailable workspaces are only retried if the folder reappears or session updates.
                 expected = os.path.join(target_cwd, ".harness", "LIVE_CONTEXT.md")
                 if live_path == expected or target_cwd == self.engine.harness_home:
                     self.last_seen[target_cwd] = signature
+                    self.fallback_seen.pop(target_cwd, None)
+                else:
+                    self.fallback_seen[target_cwd] = (signature, dir_exists)
                 paths.append(live_path)
             except OSError as exc:
                 print(f"[watcher] Could not sync {target_cwd!r}: {exc}. Will retry.", file=sys.stderr, flush=True)
@@ -75,7 +84,7 @@ class ContextWatcher:
 
     def run_loop(
         self,
-        interval: float = 2.0,
+        interval: float = 30.0,
         cwd: Optional[str] = None,
         update_agent_md: bool = True,
         max_iterations: Optional[int] = None,
@@ -100,7 +109,7 @@ class ContextWatcher:
                 break
             time.sleep(interval)
 
-    def start_daemon(self, interval: float = 2.0, cwd: Optional[str] = None) -> int:
+    def start_daemon(self, interval: float = 30.0, cwd: Optional[str] = None) -> int:
         """Spawn the watcher in the background and record its PID across Windows, macOS, and Linux."""
         status = self.daemon_status()
         if status["running"]:

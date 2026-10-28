@@ -28,6 +28,7 @@ class GrokAdapter(BaseAdapter):
     def __init__(self, grok_home: Optional[str] = None) -> None:
         self.grok_home = os.path.expanduser(grok_home or get_default_agent_homes()["grok"])
         self.sessions_dir = os.path.join(self.grok_home, "sessions")
+        self._summary_cache: Dict[str, tuple[int, int, Optional[SessionSummary]]] = {}
 
     def _iter_session_files(self) -> List[str]:
         candidates: List[str] = []
@@ -41,67 +42,87 @@ class GrokAdapter(BaseAdapter):
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return candidates
 
+    def _quick_scan(self, fpath: str) -> Optional[SessionSummary]:
+        try:
+            st = os.stat(fpath)
+            mtime = st.st_mtime
+            cache_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+        cached = self._summary_cache.get(fpath)
+        if cached and cached[0] == cache_key[0] and cached[1] == cache_key[1]:
+            return cached[2]
+
+        sid = os.path.splitext(os.path.basename(fpath))[0]
+        session_cwd = ""
+        title = ""
+        user_prompts: List[str] = []
+        has_non_meta_user = False
+        has_assistant = False
+
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
+                for line_idx, line in enumerate(fp):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not session_cwd and obj.get("cwd"):
+                        session_cwd = obj["cwd"]
+                    if obj.get("title") and not title:
+                        title = obj["title"]
+                    role = obj.get("role") or obj.get("message", {}).get("role")
+                    content = str(obj.get("content") or obj.get("message", {}).get("content") or "").strip()
+                    if role == "user" and content:
+                        user_prompts.append(content)
+                        if not is_meta_handoff_text(content):
+                            has_non_meta_user = True
+                        if not title:
+                            title = content[:100].replace("\n", " ")
+                    elif role == "assistant" and content:
+                        has_assistant = True
+
+                    if session_cwd and has_non_meta_user and has_assistant:
+                        break
+                    if line_idx >= 120 and (session_cwd or user_prompts or has_assistant):
+                        break
+        except OSError:
+            return None
+
+        if not user_prompts and not title and not has_assistant:
+            self._summary_cache[fpath] = (cache_key[0], cache_key[1], None)
+            return None
+
+        is_meta = bool(user_prompts) and not has_non_meta_user
+        turn_count = len(user_prompts) * 2 if has_assistant else len(user_prompts)
+        updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        summary = SessionSummary(
+            agent="grok",
+            session_id=sid,
+            title=title or f"Grok session {sid[:8]}",
+            cwd=session_cwd,
+            updated_at=updated_at,
+            mtime=mtime,
+            source_path=fpath,
+            turn_count=max(turn_count, 1),
+            is_meta_session=is_meta,
+        )
+        self._summary_cache[fpath] = (cache_key[0], cache_key[1], summary)
+        return summary
+
     def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         results: List[SessionSummary] = []
         for fpath in self._iter_session_files():
-            try:
-                mtime = os.path.getmtime(fpath)
-            except OSError:
+            summary = self._quick_scan(fpath)
+            if not summary:
                 continue
-
-            sid = os.path.splitext(os.path.basename(fpath))[0]
-            session_cwd = ""
-            title = ""
-            user_prompts: List[str] = []
-            has_assistant = False
-
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
-                    for line in fp:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not session_cwd and obj.get("cwd"):
-                            session_cwd = obj["cwd"]
-                        if obj.get("title") and not title:
-                            title = obj["title"]
-                        role = obj.get("role") or obj.get("message", {}).get("role")
-                        content = str(obj.get("content") or obj.get("message", {}).get("content") or "").strip()
-                        if role == "user" and content:
-                            user_prompts.append(content)
-                            if not title:
-                                title = content[:100].replace("\n", " ")
-                        elif role == "assistant" and content:
-                            has_assistant = True
-            except OSError:
+            if cwd and not paths_match(cwd, summary.cwd):
                 continue
-
-            if not user_prompts and not title and not has_assistant:
-                continue
-
-            if cwd and not paths_match(cwd, session_cwd):
-                continue
-
-            is_meta = bool(user_prompts) and all(is_meta_handoff_text(p) for p in user_prompts)
-            turn_count = len(user_prompts) * 2 if has_assistant else len(user_prompts)
-            updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            results.append(
-                SessionSummary(
-                    agent="grok",
-                    session_id=sid,
-                    title=title or f"Grok session {sid[:8]}",
-                    cwd=session_cwd,
-                    updated_at=updated_at,
-                    mtime=mtime,
-                    source_path=fpath,
-                    turn_count=max(turn_count, 1),
-                    is_meta_session=is_meta,
-                )
-            )
+            results.append(summary)
             if limit is not None and len(results) >= limit:
                 break
         return results

@@ -36,6 +36,7 @@ class ClaudeAdapter(BaseAdapter):
         self.claude_home = os.path.expanduser(claude_home or get_default_agent_homes()["claude"])
         self.projects_dir = os.path.join(self.claude_home, "projects")
         self.plans_dir = os.path.join(self.claude_home, "plans")
+        self._summary_cache: Dict[str, tuple[int, int, Optional[SessionSummary]]] = {}
 
     def _iter_jsonl_files(self) -> List[str]:
         if not os.path.isdir(self.projects_dir):
@@ -119,20 +120,28 @@ class ClaudeAdapter(BaseAdapter):
 
     def _quick_scan_file(self, fpath: str) -> Optional[SessionSummary]:
         try:
-            mtime = os.path.getmtime(fpath)
+            st = os.stat(fpath)
+            mtime = st.st_mtime
+            cache_key = (st.st_mtime_ns, st.st_size)
         except OSError:
             return None
+
+        cached = self._summary_cache.get(fpath)
+        if cached and cached[0] == cache_key[0] and cached[1] == cache_key[1]:
+            return cached[2]
 
         session_id = os.path.splitext(os.path.basename(fpath))[0]
         cwd = ""
         title = ""
         user_prompts: List[str] = []
+        has_non_meta_user = False
         has_assistant = False
+        stopped_early = False
 
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
-                for line in fp:
-                    line = line.strip()
+            with open(fpath, "rb") as fp:
+                for line_idx, raw_line in enumerate(fp):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -152,21 +161,51 @@ class ClaudeAdapter(BaseAdapter):
                         text = self._extract_user_text(msg.get("content"))
                         if text:
                             user_prompts.append(text)
+                            if not is_meta_handoff_text(text):
+                                has_non_meta_user = True
                     elif t == "assistant":
                         has_assistant = True
+
+                    # Stop reading once project folder, non-meta user prompt, and assistant response are found
+                    if cwd and has_non_meta_user and has_assistant:
+                        stopped_early = True
+                        break
+                    if line_idx >= 120 and (cwd or user_prompts or has_assistant):
+                        stopped_early = True
+                        break
+
+                # Check last 4 KB for ai-title / last-prompt if we stopped early
+                if stopped_early and not title:
+                    offset = max(0, st.st_size - 4096)
+                    fp.seek(offset)
+                    tail_lines = fp.read().decode("utf-8", errors="replace").splitlines()
+                    for tail_line in (tail_lines[1:] if offset > 0 else tail_lines):
+                        tail_line = tail_line.strip()
+                        if not tail_line or ("ai-title" not in tail_line and "last-prompt" not in tail_line):
+                            continue
+                        try:
+                            tail_obj = json.loads(tail_line)
+                        except json.JSONDecodeError:
+                            continue
+                        tt = tail_obj.get("type")
+                        if tt == "ai-title" and tail_obj.get("aiTitle"):
+                            title = tail_obj["aiTitle"]
+                        elif tt == "last-prompt" and tail_obj.get("lastPrompt") and not title:
+                            title = tail_obj["lastPrompt"][:100].replace("\n", " ")
         except OSError:
             return None
 
         if not user_prompts and not title and not has_assistant:
+            self._summary_cache[fpath] = (cache_key[0], cache_key[1], None)
             return None
 
         first_user_text = user_prompts[0][:100].replace("\n", " ") if user_prompts else ""
         display_title = title or first_user_text or f"Claude session {session_id[:8]}"
         updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        is_meta = bool(user_prompts) and all(is_meta_handoff_text(p) for p in user_prompts)
+        is_meta = bool(user_prompts) and not has_non_meta_user
         turn_count = len(user_prompts) * 2 if has_assistant else len(user_prompts)
 
-        return SessionSummary(
+        summary = SessionSummary(
             agent="claude",
             session_id=session_id,
             title=display_title.strip(),
@@ -177,6 +216,8 @@ class ClaudeAdapter(BaseAdapter):
             turn_count=max(turn_count, 1),
             is_meta_session=is_meta,
         )
+        self._summary_cache[fpath] = (cache_key[0], cache_key[1], summary)
+        return summary
 
     def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         results: List[SessionSummary] = []

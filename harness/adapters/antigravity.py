@@ -68,12 +68,18 @@ class AntigravityAdapter(BaseAdapter):
         self.agy_home = os.path.expanduser(agy_home or get_default_agent_homes()["antigravity"])
         self.brain_dir = os.path.join(self.agy_home, "brain")
         self.summaries_db = os.path.join(self.agy_home, "conversation_summaries.db")
+        self._db_meta_cache: Optional[tuple[int, int, Dict[str, Dict[str, Any]]]] = None
+        self._summary_cache: Dict[str, tuple[int, int, str, str, Optional[SessionSummary]]] = {}
 
     def _load_db_metadata(self) -> Dict[str, Dict[str, Any]]:
         """Read titles, workspace_uris, and subagent flags from conversation_summaries.db."""
         meta: Dict[str, Dict[str, Any]] = {}
-        if not os.path.isfile(self.summaries_db):
+        try:
+            st = os.stat(self.summaries_db)
+        except OSError:
             return meta
+        if self._db_meta_cache and self._db_meta_cache[0] == st.st_mtime_ns and self._db_meta_cache[1] == st.st_size:
+            return self._db_meta_cache[2]
         try:
             conn = sqlite_ro_connect(self.summaries_db, timeout=2.0)
             conn.row_factory = sqlite3.Row
@@ -98,6 +104,7 @@ class AntigravityAdapter(BaseAdapter):
                     "is_subagent": bool(r["parent_conversation_id"]) or int(r["nesting_depth"] or 0) > 0,
                 }
             conn.close()
+            self._db_meta_cache = (st.st_mtime_ns, st.st_size, meta)
         except Exception:
             pass
         return meta
@@ -169,7 +176,8 @@ class AntigravityAdapter(BaseAdapter):
 
     def _quick_scan(self, fpath: str, db_meta: Dict[str, Dict[str, Any]]) -> Optional[SessionSummary]:
         try:
-            mtime = os.path.getmtime(fpath)
+            st = os.stat(fpath)
+            mtime = st.st_mtime
         except OSError:
             return None
 
@@ -180,13 +188,19 @@ class AntigravityAdapter(BaseAdapter):
 
         cwd = info.get("cwd", "")
         db_title = info.get("title", "")
+        cache_key = (st.st_mtime_ns, st.st_size, db_title, cwd)
+        cached = self._summary_cache.get(fpath)
+        if cached and cached[:4] == cache_key:
+            return cached[4]
+
         first_user_title = ""
         user_prompts: List[str] = []
+        has_non_meta_user = False
         has_planner = False
 
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
-                for line in fp:
+                for line_idx, line in enumerate(fp):
                     line = line.strip()
                     if not line:
                         continue
@@ -200,6 +214,8 @@ class AntigravityAdapter(BaseAdapter):
                         txt = _clean_user_request(obj.get("content", ""))
                         if txt:
                             user_prompts.append(txt)
+                            if not is_meta_handoff_text(txt):
+                                has_non_meta_user = True
                             if not first_user_title:
                                 first_user_title = txt[:100].replace("\n", " ")
                     elif stype == "PLANNER_RESPONSE":
@@ -212,19 +228,26 @@ class AntigravityAdapter(BaseAdapter):
                                 if candidate_cwd:
                                     cwd = candidate_cwd
                                     break
+
+                    # Stop reading once project folder, non-meta user prompt, and planner response are found
+                    if cwd and has_non_meta_user and has_planner:
+                        break
+                    if line_idx >= 120 and user_prompts:
+                        break
         except OSError:
             return None
 
         # Skip subagent transcripts that have zero USER_INPUT steps
         if not user_prompts:
+            self._summary_cache[fpath] = (*cache_key, None)
             return None
 
         title = db_title or first_user_title or f"Antigravity session {session_id[:8]}"
-        is_meta = all(is_meta_handoff_text(p) for p in user_prompts)
+        is_meta = not has_non_meta_user
         turn_count = len(user_prompts) * 2 if has_planner else len(user_prompts)
         updated_at = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        return SessionSummary(
+        summary = SessionSummary(
             agent="antigravity",
             session_id=session_id,
             title=title.strip(),
@@ -235,6 +258,8 @@ class AntigravityAdapter(BaseAdapter):
             turn_count=max(turn_count, 1),
             is_meta_session=is_meta,
         )
+        self._summary_cache[fpath] = (*cache_key, summary)
+        return summary
 
     def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         db_meta = self._load_db_metadata()

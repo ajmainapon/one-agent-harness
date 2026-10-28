@@ -313,6 +313,31 @@ class TestHandoffReliability(unittest.TestCase):
         self.assertEqual(target.read_text(), 'original')
         self.assertEqual(list(self.root.glob('.harness-*')), [])
 
+    def test_unchanged_session_files_are_cached_and_fallback_workspaces_do_not_loop(self):
+        # 1. Verify unchanged files are not re-opened on subsequent list_sessions() calls
+        first = self.engine.list_sessions(limit=None)
+        self.assertTrue(first)
+        with patch('builtins.open', side_effect=AssertionError('Unchanged files must not be re-opened')):
+            second = self.engine.list_sessions(limit=None)
+        self.assertEqual([s.session_id for s in first], [s.session_id for s in second])
+
+        # 2. Verify unavailable workspace only writes fallback once until folder reappears
+        missing_ws = self.root / 'unmounted-drive-project'
+        path = Path(self.fixture.grok_home) / 'sessions' / 'unmounted.jsonl'
+        path.write_text(json.dumps({'role': 'user', 'content': 'Work on external drive', 'cwd': str(missing_ws)}) + '\n')
+        os.utime(path, (100, 100))
+        watcher = ContextWatcher(self.engine)
+        with redirect_stderr(io.StringIO()):
+            first_sync = watcher.sync_changed_workspaces()
+            second_sync = watcher.sync_changed_workspaces()
+        self.assertTrue(any('workspaces' in p for p in first_sync))
+        self.assertEqual(second_sync, [])
+
+        # When the drive is mounted again, watcher automatically syncs to the real workspace
+        missing_ws.mkdir(exist_ok=True)
+        third_sync = watcher.sync_changed_workspaces()
+        self.assertEqual(third_sync, [str(missing_ws / '.harness' / 'LIVE_CONTEXT.md')])
+
 
 if __name__ == '__main__':
     unittest.main()

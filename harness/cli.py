@@ -465,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--daemon", action="store_true", help="Run watcher in the background")
     p_watch.add_argument("--stop", action="store_true", help="Stop background watcher daemon")
     p_watch.add_argument("--status", action="store_true", help="Check background watcher daemon status")
-    p_watch.add_argument("--interval", type=_positive_interval, default=2.0, help="Polling interval in seconds")
+    p_watch.add_argument("--interval", type=_positive_interval, default=30.0, help="Polling interval in seconds (default: 30)")
     p_watch.add_argument("--cwd", help="Optional specific workspace directory to watch")
     p_watch.set_defaults(func=cmd_watch)
 

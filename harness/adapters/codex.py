@@ -34,11 +34,30 @@ class CodexAdapter(BaseAdapter):
         self.sessions_dir = os.path.join(self.codex_home, "sessions")
         self.index_file = os.path.join(self.codex_home, "session_index.jsonl")
         self.state_db = os.path.join(self.codex_home, "state_5.sqlite")
+        self._thread_meta_cache: Optional[tuple[tuple[int, int, int, int], Dict[str, Dict[str, Any]]]] = None
+        self._summary_cache: Dict[str, tuple[int, int, Optional[SessionSummary]]] = {}
 
     def _load_thread_meta(self) -> Dict[str, Dict[str, Any]]:
+        idx_sig = (0, 0)
+        db_sig = (0, 0)
+        try:
+            st_i = os.stat(self.index_file)
+            idx_sig = (st_i.st_mtime_ns, st_i.st_size)
+        except OSError:
+            pass
+        try:
+            st_d = os.stat(self.state_db)
+            db_sig = (st_d.st_mtime_ns, st_d.st_size)
+        except OSError:
+            pass
+
+        combined_sig = (idx_sig[0], idx_sig[1], db_sig[0], db_sig[1])
+        if self._thread_meta_cache and self._thread_meta_cache[0] == combined_sig:
+            return self._thread_meta_cache[1]
+
         meta: Dict[str, Dict[str, Any]] = {}
         # 1. Read session_index.jsonl
-        if os.path.isfile(self.index_file):
+        if idx_sig != (0, 0):
             try:
                 with open(self.index_file, "r", encoding="utf-8", errors="replace") as fp:
                     for line in fp:
@@ -55,7 +74,7 @@ class CodexAdapter(BaseAdapter):
                 pass
 
         # 2. Read state_5.sqlite threads table if available
-        if os.path.isfile(self.state_db):
+        if db_sig != (0, 0):
             try:
                 conn = sqlite_ro_connect(self.state_db, timeout=2.0)
                 conn.row_factory = sqlite3.Row
@@ -79,6 +98,8 @@ class CodexAdapter(BaseAdapter):
                 conn.close()
             except Exception:
                 pass
+        self._thread_meta_cache = (combined_sig, meta)
+        self._summary_cache.clear()
         return meta
 
     def _iter_rollout_files(self) -> List[str]:
@@ -182,20 +203,28 @@ class CodexAdapter(BaseAdapter):
 
     def _quick_scan(self, fpath: str, thread_meta: Dict[str, Dict[str, Any]]) -> Optional[SessionSummary]:
         try:
-            file_mtime = os.path.getmtime(fpath)
+            st = os.stat(fpath)
+            file_mtime = st.st_mtime
+            cache_key = (st.st_mtime_ns, st.st_size)
         except OSError:
             return None
+
+        cached = self._summary_cache.get(fpath)
+        if cached and cached[0] == cache_key[0] and cached[1] == cache_key[1]:
+            return cached[2]
 
         session_id = ""
         cwd = ""
         user_prompts: List[str] = []
+        has_non_meta_user = False
         has_assistant = False
         last_msg_ts = ""
+        stopped_early = False
 
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as fp:
-                for line in fp:
-                    line = line.strip()
+            with open(fpath, "rb") as fp:
+                for line_idx, raw_line in enumerate(fp):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
                     try:
@@ -207,6 +236,7 @@ class CodexAdapter(BaseAdapter):
                     payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
                     if t == "session_meta":
                         if self._is_internal_session_meta(payload):
+                            self._summary_cache[fpath] = (cache_key[0], cache_key[1], None)
                             return None
                         session_id = payload.get("id") or payload.get("session_id") or session_id
                         cwd = payload.get("cwd") or cwd
@@ -219,10 +249,37 @@ class CodexAdapter(BaseAdapter):
                                 txt = self._extract_message_text(payload.get("content"))
                                 if txt:
                                     user_prompts.append(txt)
+                                    if not is_meta_handoff_text(txt):
+                                        has_non_meta_user = True
                             elif role == "assistant":
                                 txt = self._extract_message_text(payload.get("content"))
                                 if txt:
                                     has_assistant = True
+
+                    # Stop reading once project folder, non-meta user prompt, and assistant response are found
+                    if cwd and has_non_meta_user and has_assistant:
+                        stopped_early = True
+                        break
+                    if line_idx >= 120 and (cwd or user_prompts or has_assistant):
+                        stopped_early = True
+                        break
+
+                # Read tail 8 KB to capture latest response_item timestamp if we stopped early
+                if stopped_early:
+                    offset = max(0, st.st_size - 8192)
+                    fp.seek(offset)
+                    tail_lines = fp.read().decode("utf-8", errors="replace").splitlines()
+                    for tail_line in reversed(tail_lines[1:] if offset > 0 else tail_lines):
+                        tail_line = tail_line.strip()
+                        if not tail_line or "response_item" not in tail_line:
+                            continue
+                        try:
+                            tail_obj = json.loads(tail_line)
+                        except json.JSONDecodeError:
+                            continue
+                        if tail_obj.get("type") == "response_item" and tail_obj.get("timestamp"):
+                            last_msg_ts = tail_obj["timestamp"]
+                            break
         except OSError:
             return None
 
@@ -235,20 +292,23 @@ class CodexAdapter(BaseAdapter):
 
         t_info = thread_meta.get(session_id, {})
         if t_info.get("is_internal"):
+            self._summary_cache[fpath] = (cache_key[0], cache_key[1], None)
             return None
         if not cwd and t_info.get("cwd"):
             cwd = t_info["cwd"]
 
         if not user_prompts and not t_info.get("title") and not has_assistant:
+            self._summary_cache[fpath] = (cache_key[0], cache_key[1], None)
             return None
 
         first_user_text = user_prompts[0][:100].replace("\n", " ") if user_prompts else ""
         title = t_info.get("title") or first_user_text or f"Codex session {session_id[:8]}"
         if title.lower() == "guardian review":
+            self._summary_cache[fpath] = (cache_key[0], cache_key[1], None)
             return None
 
         is_meta = (
-            (bool(user_prompts) and all(is_meta_handoff_text(p) for p in user_prompts))
+            (bool(user_prompts) and not has_non_meta_user)
             or is_meta_handoff_text(title)
             or title.lower() == "load handoff context"
         )
@@ -258,7 +318,7 @@ class CodexAdapter(BaseAdapter):
         effective_mtime = parsed_ts if parsed_ts is not None else file_mtime
         updated_at = datetime.fromtimestamp(effective_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        return SessionSummary(
+        summary = SessionSummary(
             agent="codex",
             session_id=session_id,
             title=title.strip(),
@@ -269,6 +329,8 @@ class CodexAdapter(BaseAdapter):
             turn_count=max(turn_count, 1),
             is_meta_session=is_meta,
         )
+        self._summary_cache[fpath] = (cache_key[0], cache_key[1], summary)
+        return summary
 
     def list_sessions(self, cwd: Optional[str] = None, limit: Optional[int] = 20) -> List[SessionSummary]:
         thread_meta = self._load_thread_meta()
